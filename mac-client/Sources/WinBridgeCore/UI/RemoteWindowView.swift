@@ -87,10 +87,13 @@ final class RemoteWindowView: NSView, @preconcurrency NSTextInputClient {
 
     private(set) var gameLockEnabled = false
     private(set) var gameLockState: GameLockState = .off
+    private(set) var alwaysShowLocalCursor = false
     private var remoteCursorHidden = false
     private var isCursorHidden = false
     private var pointerLockedAt: Date?
     private var gameLockEventMonitor: Any?
+    private var lastCursorShape: CursorShape?
+    private var lastLoggedCursorSummary: String?
 
     private let videoLayer = CALayer()
     private let hudContainer = NSView()
@@ -354,10 +357,41 @@ final class RemoteWindowView: NSView, @preconcurrency NSTextInputClient {
         CATransaction.commit()
     }
 
+    func setAlwaysShowLocalCursor(_ enabled: Bool) {
+        guard enabled != alwaysShowLocalCursor else { return }
+        alwaysShowLocalCursor = enabled
+        ClientLogger.shared.info(
+            "AlwaysShowLocalCursor \(enabled ? "ENABLED" : "DISABLED") for window 0x\(String(windowId, radix: 16))"
+        )
+        if let lastCursorShape {
+            activeCursor = CursorMapper.cursor(
+                from: lastCursorShape,
+                forceVisible: enabled && gameLockState != .relativeLocked
+            )
+        } else if enabled {
+            activeCursor = .arrow
+        }
+        if mouseInside && gameLockState != .relativeLocked {
+            activeCursor.set()
+        }
+        window?.invalidateCursorRects(for: self)
+    }
+
     func applyCursorShape(_ shape: CursorShape) {
+        lastCursorShape = shape
         let hidden = CursorMapper.isEffectivelyHidden(shape)
-        let cursor = CursorMapper.cursor(from: shape)
-        activeCursor = cursor
+        let summary: String
+        if shape.cursorType == .custom {
+            let visible = CursorMapper.visiblePixelCount(shape)
+            summary = "custom \(shape.width)x\(shape.height) hotspot=(\(shape.hotspotX),\(shape.hotspotY)) visiblePx=\(visible)"
+        } else {
+            summary = "\(shape.cursorType)"
+        }
+        if summary != lastLoggedCursorSummary {
+            lastLoggedCursorSummary = summary
+            ClientLogger.shared.info("Cursor 0x\(String(windowId, radix: 16)) -> \(summary)")
+        }
+
         if hidden != remoteCursorHidden {
             remoteCursorHidden = hidden
             if gameLockEnabled {
@@ -367,6 +401,11 @@ final class RemoteWindowView: NSView, @preconcurrency NSTextInputClient {
             }
             reconcileGameLockState()
         }
+        let cursor = CursorMapper.cursor(
+            from: shape,
+            forceVisible: alwaysShowLocalCursor && gameLockState != .relativeLocked
+        )
+        activeCursor = cursor
         if mouseInside && gameLockState != .relativeLocked {
             cursor.set()
         }
@@ -674,6 +713,13 @@ final class RemoteWindowView: NSView, @preconcurrency NSTextInputClient {
             if isCursorHidden {
                 NSCursor.unhide()
                 isCursorHidden = false
+            }
+            if let lastCursorShape {
+                activeCursor = CursorMapper.cursor(
+                    from: lastCursorShape,
+                    forceVisible: alwaysShowLocalCursor
+                )
+                window?.invalidateCursorRects(for: self)
             }
             if mouseInside {
                 activeCursor.set()

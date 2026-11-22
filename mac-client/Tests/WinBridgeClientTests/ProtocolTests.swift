@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import Testing
 @testable import WinBridgeCore
@@ -168,8 +169,60 @@ import Testing
     #expect(!CursorMapper.isEffectivelyHidden(CursorShape(cursorType: .arrow)))
     let transparent = CursorShape(cursorType: .custom, customRgba: Data(repeating: 0, count: 16), width: 2, height: 2)
     #expect(CursorMapper.isEffectivelyHidden(transparent))
+    #expect(CursorMapper.visiblePixelCount(transparent) == 0)
     let visibleCustom = CursorShape(cursorType: .custom, customRgba: Data([255, 255, 255, 255]), width: 1, height: 1)
     #expect(!CursorMapper.isEffectivelyHidden(visibleCustom))
+    #expect(CursorMapper.visiblePixelCount(visibleCustom) == 1)
+    #expect(CursorMapper.resolvedCursorType(for: CursorShape(cursorType: .hidden), forceVisible: false) == .hidden)
+    #expect(CursorMapper.resolvedCursorType(for: CursorShape(cursorType: .hidden), forceVisible: true) == .arrow)
+    #expect(CursorMapper.resolvedCursorType(for: transparent, forceVisible: true) == .arrow)
+    #expect(CursorMapper.resolvedCursorType(for: visibleCustom, forceVisible: true) == .custom)
+}
+
+@Test func cursorMapperBuildsPremultipliedRetinaCustomCursorAndCapsOversized4KCursors() {
+    // Standard 32x32 stays 32x32pt
+    let layout32 = CursorMapper.logicalLayout(pixelWidth: 32, pixelHeight: 32, hotspotX: 4, hotspotY: 6)
+    #expect(layout32.size == NSSize(width: 32, height: 32))
+    #expect(layout32.hotSpot == NSPoint(x: 4, y: 6))
+
+    // 64x64 Retina scales down 2x to 32x32pt
+    let layout64 = CursorMapper.logicalLayout(pixelWidth: 64, pixelHeight: 64, hotspotX: 10, hotspotY: 12)
+    #expect(layout64.size == NSSize(width: 32, height: 32))
+    #expect(layout64.hotSpot == NSPoint(x: 5, y: 6))
+
+    // Oversized 256x256 4K custom game cursor is capped at 64x64pt so macOS never drops it
+    let layout256 = CursorMapper.logicalLayout(pixelWidth: 256, pixelHeight: 256, hotspotX: 32, hotspotY: 64)
+    #expect(layout256.size == NSSize(width: 64, height: 64))
+    #expect(layout256.hotSpot == NSPoint(x: 8, y: 16))
+
+    // Premultiplication check on semi-transparent straight RGBA pixel
+    let rgba = Data([
+        200, 100, 50, 128,  // straight semi-transparent
+        255, 255, 255, 255, // opaque white
+        123, 45, 67, 0,     // fully transparent (must zero RGB)
+        0, 0, 255, 255,     // opaque blue
+    ])
+    let shape = CursorShape(
+        cursorType: .custom,
+        customRgba: rgba,
+        width: 2,
+        height: 2,
+        hotspotX: 1,
+        hotspotY: 0
+    )
+    let built = CursorMapper.buildCustomCursorImage(shape)
+    #expect(built != nil)
+    #expect(built?.image.size == NSSize(width: 2, height: 2))
+    #expect(built?.hotSpot == NSPoint(x: 1, y: 0))
+    let rep = built?.image.representations.first as? NSBitmapImageRep
+    #expect(rep != nil)
+    if let ptr = rep?.bitmapData {
+        // (200 * 128 + 127) / 255 = 100, (100 * 128 + 127) / 255 = 50, (50 * 128 + 127) / 255 = 25
+        #expect(ptr[0] == 100 && ptr[1] == 50 && ptr[2] == 25 && ptr[3] == 128)
+        #expect(ptr[4] == 255 && ptr[5] == 255 && ptr[6] == 255 && ptr[7] == 255)
+        #expect(ptr[8] == 0 && ptr[9] == 0 && ptr[10] == 0 && ptr[11] == 0)
+        #expect(ptr[12] == 0 && ptr[13] == 0 && ptr[14] == 255 && ptr[15] == 255)
+    }
 }
 
 @Test func filePullMessagesRoundTrip() throws {

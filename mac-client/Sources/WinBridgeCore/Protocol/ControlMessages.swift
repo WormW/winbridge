@@ -132,7 +132,7 @@ enum HostErrorCode: Int32, Sendable {
 // MARK: - Messages
 
 enum ProtocolCapabilities {
-    static let currentAppVersion = "0.5.2"
+    static let currentAppVersion = "0.5.3"
     static let processAudio: UInt32 = 1 << 0
     static let filePull: UInt32 = 1 << 1
     static let clipboardFiles: UInt32 = 1 << 2

@@ -396,6 +396,21 @@ final class RemoteWindowController: NSWindowController, NSWindowDelegate {
         remoteView.applyCursorShape(shape)
     }
 
+    var isAlwaysShowLocalCursor: Bool {
+        remoteView.alwaysShowLocalCursor
+    }
+
+    func toggleAlwaysShowLocalCursor() {
+        guard info.kind != .popup else { return }
+        let next = !remoteView.alwaysShowLocalCursor
+        remoteView.setAlwaysShowLocalCursor(next)
+        showToast(
+            next ? "🖱️ 已强制显示本地鼠标指针" : "已恢复跟随远端鼠标指针",
+            style: .progress,
+            autoHideSeconds: 2.0
+        )
+    }
+
     func showToast(_ text: String, style: TransferToastStyle, autoHideSeconds: TimeInterval?) {
         guard info.kind != .popup else { return }
         remoteView.showToast(text, style: style, autoHideSeconds: autoHideSeconds)

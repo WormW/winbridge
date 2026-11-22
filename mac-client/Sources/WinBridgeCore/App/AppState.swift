@@ -414,6 +414,20 @@ final class AppState {
         return wc.isPinnedOnTop
     }
 
+    func isActiveWindowAlwaysShowingLocalCursor() -> Bool {
+        guard let wc = NSApp.keyWindow?.windowController as? RemoteWindowController else { return false }
+        return wc.isAlwaysShowLocalCursor
+    }
+
+    func toggleAlwaysShowLocalCursorForActiveWindow() {
+        guard let wc = NSApp.keyWindow?.windowController as? RemoteWindowController else {
+            setBanner("请先选中一个正在投射的 Windows 窗口", isError: true)
+            onStateChanged?()
+            return
+        }
+        wc.toggleAlwaysShowLocalCursor()
+    }
+
     func togglePinOnTopForActiveWindow() {
         guard let wc = NSApp.keyWindow?.windowController as? RemoteWindowController else {
             setBanner("请先选中一个正在投射的 Windows 窗口", isError: true)

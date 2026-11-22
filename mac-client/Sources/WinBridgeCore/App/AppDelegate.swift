@@ -126,6 +126,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         state.toggleAutoGameLockForActiveWindow()
     }
 
+    @objc private func toggleAlwaysShowLocalCursorAction() {
+        state.toggleAlwaysShowLocalCursorForActiveWindow()
+    }
+
     @objc private func toggleHudAction() {
         state.togglePerformanceHud()
     }
@@ -297,6 +301,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lockItem.keyEquivalentModifierMask = sc.toggleGameLock.modifierFlags
         winMenu.addItem(lockItem)
         winMenu.addItem(withTitle: "记住当前游戏自动开启鼠标锁定", action: #selector(toggleAutoGameLockAction), keyEquivalent: "")
+        let forceCursorItem = NSMenuItem(
+            title: "始终显示本地鼠标指针（游戏光标消失时开启）",
+            action: #selector(toggleAlwaysShowLocalCursorAction),
+            keyEquivalent: ""
+        )
+        forceCursorItem.state = state.isActiveWindowAlwaysShowingLocalCursor() ? .on : .off
+        winMenu.addItem(forceCursorItem)
         let hudItem = NSMenuItem(
             title: "显示 / 隐藏性能 HUD",
             action: #selector(toggleHudAction),
