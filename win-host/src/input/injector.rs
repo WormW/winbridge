@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{bail, ensure, Context, Result};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     io, mem, ptr,
     sync::mpsc as sync,
     time::{Duration, Instant},
@@ -136,6 +136,62 @@ struct DragAnchor {
     height: u32,
 }
 
+const MAX_RAW_ASSIST_STEP: i32 = 16;
+
+/// Anti-automation / IM apps that should stay strictly on `SetCursorPos` for pointer movement
+/// (never emitting `SendInput(MOUSEEVENTF_MOVE)` streams into `WH_MOUSE_LL`).
+fn is_setcursorpos_only_process(process_name: &str) -> bool {
+    matches!(
+        process_name.to_ascii_lowercase().as_str(),
+        "weixin.exe"
+            | "wechat.exe"
+            | "wechatappex.exe"
+            | "wechatplayer.exe"
+            | "wechatbrowser.exe"
+            | "qq.exe"
+            | "tim.exe"
+            | "wxwork.exe"
+            | "dingtalk.exe"
+            | "feishu.exe"
+            | "lark.exe"
+    )
+}
+
+/// Computes a bounded `(pre_pos, relative_step)` pair strictly inside `[min_bound, max_bound]`
+/// so `SetCursorPos(pre)` + `SendInput(MOUSEEVENTF_MOVE, step)` emits genuine `MOUSE_MOVE_RELATIVE`
+/// `WM_INPUT` (waking Unity / DirectInput in-game software cursors) while guaranteeing the cursor
+/// never escapes the target window even under 2x Windows pointer acceleration.
+fn bounded_raw_step(cur: i32, dst: i32, min_bound: i32, max_bound: i32) -> (i32, i32) {
+    let delta = dst.saturating_sub(cur);
+    if delta == 0 || max_bound <= min_bound || dst < min_bound || dst > max_bound {
+        return (dst, 0);
+    }
+    if delta > 0 {
+        let room_behind = dst.saturating_sub(min_bound);
+        if room_behind <= 0 {
+            return (dst, 0);
+        }
+        let room_ahead_safe = (max_bound.saturating_sub(dst) / 2).max(1);
+        let step = delta
+            .min(MAX_RAW_ASSIST_STEP)
+            .min(room_behind)
+            .min(room_ahead_safe);
+        (dst.saturating_sub(step), step)
+    } else {
+        let mag = delta.saturating_neg();
+        let room_behind = max_bound.saturating_sub(dst);
+        if room_behind <= 0 {
+            return (dst, 0);
+        }
+        let room_ahead_safe = (dst.saturating_sub(min_bound) / 2).max(1);
+        let step = mag
+            .min(MAX_RAW_ASSIST_STEP)
+            .min(room_behind)
+            .min(room_ahead_safe);
+        (dst.saturating_add(step), -step)
+    }
+}
+
 #[derive(Default)]
 struct State {
     keys: BTreeSet<u32>,
@@ -144,6 +200,8 @@ struct State {
     rel_mouse: [f64; 2],
     drag_anchor: Option<DragAnchor>,
     access_cache: HashMap<u32, (Instant, AccessStatus)>,
+    wm_input_windows: HashSet<u64>,
+    transparent_cursor_cache: HashMap<usize, bool>,
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -247,7 +305,9 @@ impl DirectExecutor {
         payload: Payload,
     ) -> Result<Option<WindowUpdated>> {
         match win32::desktop::sync_thread_desktop() {
-            Ok(on_secure) => self.0.apply_privileged_inner(target_window_id, payload, on_secure),
+            Ok(on_secure) => self
+                .0
+                .apply_privileged_inner(target_window_id, payload, on_secure),
             Err(err) if err.to_string().contains("170") => {
                 // ERROR_BUSY fallback: execute on a clean one-shot thread with zero desktop affinity.
                 let handle = std::thread::Builder::new()
@@ -313,7 +373,11 @@ impl State {
         }) == AccessStatus::ElevatedOrProtected
     }
 
-    fn resolve_pointer_rect(&mut self, target: FastWindowBounds, ev: &MouseEvent) -> (i32, i32, u32, u32) {
+    fn resolve_pointer_rect(
+        &mut self,
+        target: FastWindowBounds,
+        ev: &MouseEvent,
+    ) -> (i32, i32, u32, u32) {
         if let Some(anchor) = self.drag_anchor {
             if anchor.window_id != target.window_id {
                 self.drag_anchor = None;
@@ -359,7 +423,88 @@ impl State {
         Ok(events)
     }
 
-    fn mouse(&mut self, target: FastWindowBounds, ev: MouseEvent, on_secure_desktop: bool) -> Result<()> {
+    fn is_cursor_hidden_now(&mut self) -> bool {
+        if win32::is_cursor_tracker_active() {
+            return win32::is_cursor_currently_hidden();
+        }
+        unsafe {
+            let mut ci: CURSORINFO = mem::zeroed();
+            ci.cbSize = mem::size_of::<CURSORINFO>() as u32;
+            if GetCursorInfo(&mut ci) == 0 {
+                return false;
+            }
+            if (ci.flags & (CURSOR_SHOWING | CURSOR_SUPPRESSED)) == 0 || ci.hCursor.is_null() {
+                return true;
+            }
+            let key = ci.hCursor as usize;
+            if let Some(&cached) = self.transparent_cursor_cache.get(&key) {
+                return cached;
+            }
+            let transparent = win32::is_cursor_handle_transparent(ci.hCursor);
+            if self.transparent_cursor_cache.len() >= 128 {
+                self.transparent_cursor_cache.clear();
+            }
+            self.transparent_cursor_cache.insert(key, transparent);
+            transparent
+        }
+    }
+
+    fn should_use_raw_input_move(
+        &mut self,
+        target: FastWindowBounds,
+        allow_raw_move: bool,
+    ) -> bool {
+        if !allow_raw_move {
+            return false;
+        }
+        let is_desktop = target.window_id == win32::DESKTOP_WINDOW_ID;
+        if !is_desktop && self.wm_input_windows.contains(&target.window_id) {
+            return true;
+        }
+        if !self.is_cursor_hidden_now() {
+            return false;
+        }
+        let pid = if is_desktop {
+            unsafe {
+                let mut pt: POINT = mem::zeroed();
+                if GetCursorPos(&mut pt) != 0 {
+                    let hwnd = WindowFromPoint(pt);
+                    let mut p = 0u32;
+                    if !hwnd.is_null() {
+                        GetWindowThreadProcessId(hwnd, &mut p);
+                    }
+                    p
+                } else {
+                    0
+                }
+            }
+        } else {
+            target.pid
+        };
+        if pid != 0 && is_setcursorpos_only_process(&win32::process_name(pid)) {
+            return false;
+        }
+        if !is_desktop {
+            if self.wm_input_windows.len() >= 128 {
+                self.wm_input_windows.clear();
+            }
+            self.wm_input_windows.insert(target.window_id);
+            tracing::info!(
+                window_id = target.window_id,
+                pid = target.pid,
+                "detected hidden OS cursor; enabling WM_INPUT-assisted pointer movement"
+            );
+        }
+        true
+    }
+
+    fn mouse(
+        &mut self,
+        target: FastWindowBounds,
+        ev: MouseEvent,
+        on_secure_desktop: bool,
+        allow_raw_move: bool,
+    ) -> Result<()> {
         unsafe {
             // Pure relative pointer movement (3D game Mouse Lock mode): inject raw relative
             // MOUSEEVENTF_MOVE (without ABSOLUTE/VIRTUALDESK) with sub-pixel accumulation.
@@ -456,15 +601,50 @@ impl State {
                     send(&events)?;
                 }
             } else {
-                // Standard desktop & application windows: position the pointer with SetCursorPos
-                // instead of flooding WH_MOUSE_LL with LLMHF_INJECTED + MOUSEEVENTF_ABSOLUTE streams,
-                // and lock the coordinate origin during left-button drags so moving windows stay smooth.
+                // Standard desktop & application windows: default to SetCursorPos so anti-automation
+                // IM apps (e.g. WeChat) never see LLMHF_INJECTED move floods. When a game hides the
+                // Windows OS cursor (drawing its own Unity/DirectInput software cursor that only wakes
+                // on WM_INPUT), emit a bounded relative MOUSEEVENTF_MOVE step and snap to exact (px, py).
                 let (map_x, map_y, map_w, map_h) = self.resolve_pointer_rect(target, &ev);
                 let px = screen_pixel_axis(map_x, map_w, ev.norm_x)?;
                 let py = screen_pixel_axis(map_y, map_h, ev.norm_y)?;
                 let mut cur: POINT = mem::zeroed();
-                if GetCursorPos(&mut cur) == 0 || cur.x != px || cur.y != py {
-                    let _ = SetCursorPos(px, py);
+                let got_cur = GetCursorPos(&mut cur) != 0;
+                if !got_cur || cur.x != px || cur.y != py {
+                    if self.should_use_raw_input_move(target, allow_raw_move) {
+                        let min_x = map_x;
+                        let max_x = map_x.saturating_add(
+                            i32::try_from(map_w).unwrap_or(i32::MAX).saturating_sub(1),
+                        );
+                        let min_y = map_y;
+                        let max_y = map_y.saturating_add(
+                            i32::try_from(map_h).unwrap_or(i32::MAX).saturating_sub(1),
+                        );
+                        let (pre_x, step_x) = if got_cur {
+                            bounded_raw_step(cur.x, px, min_x, max_x)
+                        } else {
+                            (px, 0)
+                        };
+                        let (pre_y, step_y) = if got_cur {
+                            bounded_raw_step(cur.y, py, min_y, max_y)
+                        } else {
+                            (py, 0)
+                        };
+                        if step_x != 0 || step_y != 0 {
+                            if cur.x != pre_x || cur.y != pre_y {
+                                let _ = SetCursorPos(pre_x, pre_y);
+                            }
+                            let _ = send(&[mouse(MOUSEEVENTF_MOVE, 0, step_x, step_y)]);
+                            let mut after: POINT = mem::zeroed();
+                            if GetCursorPos(&mut after) == 0 || after.x != px || after.y != py {
+                                let _ = SetCursorPos(px, py);
+                            }
+                        } else {
+                            let _ = SetCursorPos(px, py);
+                        }
+                    } else {
+                        let _ = SetCursorPos(px, py);
+                    }
                 }
                 match ev.kind {
                     1 => {}
@@ -498,7 +678,11 @@ impl State {
         }
     }
 
-    fn apply_desktop(&mut self, payload: Payload, on_secure_desktop: bool) -> Result<Option<WindowUpdated>> {
+    fn apply_desktop(
+        &mut self,
+        payload: Payload,
+        on_secure_desktop: bool,
+    ) -> Result<Option<WindowUpdated>> {
         let desktop = if on_secure_desktop {
             // On Winlogon, primary screen metrics match the captured GDI desktop directly.
             let w = unsafe { GetSystemMetrics(SM_CXSCREEN) }.max(1) as u32;
@@ -525,7 +709,7 @@ impl State {
             }
         };
         match payload {
-            Payload::MouseEvent(ev) => self.mouse(desktop, ev, on_secure_desktop)?,
+            Payload::MouseEvent(ev) => self.mouse(desktop, ev, on_secure_desktop, true)?,
             Payload::KeyEvent(ev) => {
                 send(&[key_input(ev.hid_usage, ev.is_down)?])?;
                 if ev.is_down {
@@ -560,8 +744,9 @@ impl State {
         let hwnd = win32::checked_hwnd(current.window_id)?;
         let focus = || -> Result<()> {
             let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) as u32 };
-            let is_popup =
-                current.owner_window_id != 0 && (style & WS_POPUP != 0) && (style & WS_CAPTION != WS_CAPTION);
+            let is_popup = current.owner_window_id != 0
+                && (style & WS_POPUP != 0)
+                && (style & WS_CAPTION != WS_CAPTION);
             let owner = if is_popup {
                 win32::checked_hwnd(current.owner_window_id)?
             } else {
@@ -569,7 +754,7 @@ impl State {
             };
             foreground(owner)
         };
-        self.apply_window_payload(current, hwnd, payload, focus)
+        self.apply_window_payload(current, hwnd, payload, true, focus)
     }
 
     fn apply_window_payload(
@@ -577,6 +762,7 @@ impl State {
         current: FastWindowBounds,
         hwnd: windows_sys::Win32::Foundation::HWND,
         payload: Payload,
+        allow_raw_move: bool,
         focus: impl Fn() -> Result<()>,
     ) -> Result<Option<WindowUpdated>> {
         let focus_best_effort = || {
@@ -631,7 +817,7 @@ impl State {
                 if ev.kind == 2 {
                     focus_best_effort();
                 }
-                self.mouse(current, ev, false)?;
+                self.mouse(current, ev, false, allow_raw_move)?;
             }
             Payload::KeyEvent(ev) => {
                 focus_best_effort();
@@ -689,7 +875,8 @@ impl State {
                 };
                 foreground(owner)
             };
-            return self.apply_window_payload(current, hwnd, payload, focus);
+            let allow_raw_move = !is_setcursorpos_only_process(&target.process_name);
+            return self.apply_window_payload(current, hwnd, payload, allow_raw_move, focus);
         }
 
         // Standalone non-service mode: sync local thread desktop directly.
@@ -717,13 +904,17 @@ impl State {
             };
             foreground(owner)
         };
-        self.apply_window_payload(current, hwnd, payload, focus)
+        let allow_raw_move = !is_setcursorpos_only_process(&target.process_name);
+        self.apply_window_payload(current, hwnd, payload, allow_raw_move, focus)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{screen_pixel_axis, virtual_axis, FastWindowBounds, MouseEvent, State};
+    use super::{
+        bounded_raw_step, is_setcursorpos_only_process, screen_pixel_axis, virtual_axis,
+        FastWindowBounds, MouseEvent, State,
+    };
 
     #[test]
     fn negative_monitor_and_drag() {
@@ -765,11 +956,18 @@ mod tests {
             norm_y: 0.05,
             ..Default::default()
         };
-        assert_eq!(state.resolve_pointer_rect(start, &down), (100, 200, 800, 600));
+        assert_eq!(
+            state.resolve_pointer_rect(start, &down),
+            (100, 200, 800, 600)
+        );
         state.buttons.insert(1);
 
         // Window has moved +120px on Windows while dragging; anchor must hold initial rect.
-        let moved = FastWindowBounds { x: 220, y: 240, ..start };
+        let moved = FastWindowBounds {
+            x: 220,
+            y: 240,
+            ..start
+        };
         let drag = MouseEvent {
             kind: 1,
             button: 0,
@@ -777,7 +975,10 @@ mod tests {
             norm_y: 0.1,
             ..Default::default()
         };
-        assert_eq!(state.resolve_pointer_rect(moved, &drag), (100, 200, 800, 600));
+        assert_eq!(
+            state.resolve_pointer_rect(moved, &drag),
+            (100, 200, 800, 600)
+        );
 
         // Release still maps against the anchor, then clears after mouse-up handling.
         let up = MouseEvent {
@@ -792,6 +993,39 @@ mod tests {
         state.drag_anchor = None;
 
         // Next hover uses the new live window bounds.
-        assert_eq!(state.resolve_pointer_rect(moved, &drag), (220, 240, 800, 600));
+        assert_eq!(
+            state.resolve_pointer_rect(moved, &drag),
+            (220, 240, 800, 600)
+        );
+    }
+
+    #[test]
+    fn bounded_raw_step_emits_true_delta_inside_window_and_never_escapes_edges() {
+        // Interior normal move (12px <= 16px): pre == cur, zero extra SetCursorPos needed!
+        assert_eq!(bounded_raw_step(500, 512, 100, 2023), (500, 12));
+        assert_eq!(bounded_raw_step(500, 490, 100, 2023), (500, -10));
+
+        // Large jump (800px): caps step at 16px, pre stays strictly inside [100, 2023].
+        assert_eq!(bounded_raw_step(200, 1000, 100, 2023), (984, 16));
+        assert_eq!(bounded_raw_step(1800, 1000, 100, 2023), (1016, -16));
+
+        // Near right edge (3px room ahead): caps step to 1px so 2x acceleration cannot escape.
+        assert_eq!(bounded_raw_step(2010, 2020, 100, 2023), (2019, 1));
+        // Near left edge (2px room ahead): caps step to -1px.
+        assert_eq!(bounded_raw_step(115, 102, 100, 2023), (103, -1));
+
+        // Out-of-bounds over-drag or zero delta returns step 0 (pure SetCursorPos fallback).
+        assert_eq!(bounded_raw_step(500, 500, 100, 2023), (500, 0));
+        assert_eq!(bounded_raw_step(500, 90, 100, 2023), (90, 0));
+        assert_eq!(bounded_raw_step(500, 2050, 100, 2023), (2050, 0));
+    }
+
+    #[test]
+    fn setcursorpos_only_process_protects_im_apps_and_allows_games() {
+        assert!(is_setcursorpos_only_process("Weixin.exe"));
+        assert!(is_setcursorpos_only_process("WeChat.exe"));
+        assert!(is_setcursorpos_only_process("QQ.exe"));
+        assert!(!is_setcursorpos_only_process("HeavenBurnsRed.exe"));
+        assert!(!is_setcursorpos_only_process("Endfield.exe"));
     }
 }

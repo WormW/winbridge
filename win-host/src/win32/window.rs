@@ -111,7 +111,7 @@ fn class(hwnd: HWND) -> String {
 static PROCESS_NAME_CACHE: OnceLock<Mutex<HashMap<u32, (Instant, String)>>> = OnceLock::new();
 const PROCESS_NAME_CACHE_TTL: Duration = Duration::from_secs(60);
 
-fn process_name(pid: u32) -> String {
+pub(crate) fn process_name(pid: u32) -> String {
     if pid == 0 {
         return String::new();
     }

@@ -336,6 +336,13 @@ pub(super) fn cursor_pixels(icon: HICON) -> Option<(Vec<u8>, u32, u32, u32, u32)
     }
 }
 
+pub(crate) fn is_cursor_handle_transparent(icon: HICON) -> bool {
+    match cursor_pixels(icon) {
+        Some((rgba, _, _, _, _)) => !has_visible_pixel(&rgba),
+        None => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

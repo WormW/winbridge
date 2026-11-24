@@ -1,8 +1,22 @@
 use super::{image::cursor_pixels, Event};
 use crate::proto::CursorShape;
-use std::{mem, ptr};
+use std::{
+    mem, ptr,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use tokio::sync::mpsc::Sender;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
+
+static CURSOR_TRACKER_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CURSOR_CURRENTLY_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn is_cursor_tracker_active() -> bool {
+    CURSOR_TRACKER_ACTIVE.load(Ordering::Acquire)
+}
+
+pub(crate) fn is_cursor_currently_hidden() -> bool {
+    CURSOR_CURRENTLY_HIDDEN.load(Ordering::Acquire)
+}
 
 fn is_cursor_hidden_flags(flags: u32) -> bool {
     // Only treat the cursor as hidden when neither CURSOR_SHOWING (1) nor CURSOR_SUPPRESSED (2)
@@ -37,6 +51,7 @@ impl Tracker {
             .map(|(i, r)| (unsafe { LoadCursorW(ptr::null_mut(), r) }, i as i32 + 1))
             .filter(|(h, _)| !h.is_null())
             .collect();
+        CURSOR_TRACKER_ACTIVE.store(true, Ordering::Release);
         Self {
             standard,
             last: None,
@@ -102,6 +117,7 @@ impl Tracker {
                 );
                 shape.cursor_type = 1;
             }
+            CURSOR_CURRENTLY_HIDDEN.store(shape.cursor_type == 13, Ordering::Release);
             if events.try_send(Event::Cursor(shape)).is_ok() {
                 self.last = Some(key);
             }

@@ -1,6 +1,6 @@
 use std::net::{IpAddr, Ipv4Addr};
 
-pub const HOST_VERSION: &str = "0.5.3";
+pub const HOST_VERSION: &str = "0.5.4";
 
 pub const CAP_PROCESS_AUDIO: u32 = 1 << 0;
 pub const CAP_FILE_PULL: u32 = 1 << 1;
